@@ -1,0 +1,37 @@
+﻿TYPE "typ_SekvensHMI"
+VERSION : 1.0
+   STRUCT
+      Cmd_Start : Bool;   // HMI->PLC puls: Start / fortsæt (nulstilles af PLC)
+      Cmd_Reset : Bool;   // HMI->PLC puls: Reset til step 0 (nulstilles af PLC)
+      Cmd_StepConfirm : Bool;   // HMI->PLC puls: Bekræft stepskift i step-mode (nulstilles af PLC)
+      Cmd_AlarmAck : Bool;   // HMI->PLC puls: Kvittér timeout-alarm (nulstilles af PLC)
+      Cmd_Force : Bool;   // HMI->PLC puls: Tving til ForceStep (kun når ForceTilladt)
+      Cmd_SletLog : Bool;   // HMI->PLC puls: Slet log (nulstilles af PLC)
+      Sel_Hold : Bool;   // HMI->PLC kontakt: Pause
+      Sel_StepMode : Bool;   // HMI->PLC kontakt: Step-for-step
+      Sel_AutoRestart : Bool;   // HMI->PLC kontakt: Auto-genstart
+      ForceStep : Int;   // HMI->PLC: step 0..16 der skal tvinges til
+      Prefix : String[20];   // PLC->HMI: Sekvensens prefix, fx 'SPVA12'
+      Step : Int;   // PLC->HMI: Aktivt step
+      StepTekst : String[40];   // PLC->HMI: Tekst for aktivt step
+      StepTid_s : Real;   // PLC->HMI: Tid i aktivt step [s]
+      MaxTid_s : Real;   // PLC->HMI: Max tid i aktivt step [s], 0 = ingen overvågning
+      RestTid_s : Real;   // PLC->HMI: Tid til timeout [s], 0 = ingen overvågning
+      TransOK : Bool;   // PLC->HMI: Skiftebetingelse for aktivt step er opfyldt
+      Running : Bool;   // PLC->HMI: Sekvens kører (step <> 0)
+      Hold : Bool;   // PLC->HMI: Sekvens står i pause
+      RestartHold : Bool;   // PLC->HMI: Genstart-pause - afventer Start eller Reset
+      WaitConfirm : Bool;   // PLC->HMI: Step-mode venter på bekræft
+      TimeoutAlarm : Bool;   // PLC->HMI: Timeout-alarm aktiv
+      TimeoutStep : Int;   // PLC->HMI: Step der gav timeout
+      ForceTilladt : Bool;   // PLC->HMI: Tvang tilladt (pause, step-mode, genstart-pause eller step 0)
+      AntalCyklus : DInt;   // PLC->HMI: Antal gennemførte sekvenser
+      StepAktiv : Array[0..16] of Bool;   // PLC->HMI: Step bits til stepoversigt
+      StepBrugt : Array[0..16] of Bool;   // PLC->HMI: Step er i brug (tekst ikke tom) - til synlighed på HMI
+      Tekst : Array[0..16] of String[40];   // PLC->HMI: Tekst for alle step
+      MaxTidListe_s : Array[0..16] of Real;   // PLC->HMI: Max tid for alle step [s]
+      SidsteTid_s : Array[0..16] of Real;   // PLC->HMI: Seneste varighed for hvert step [s]
+      LogTekst : Array[0..49] of String[100];   // PLC->HMI: Log som tekstlinjer, [0] = nyeste
+   END_STRUCT;
+
+END_TYPE

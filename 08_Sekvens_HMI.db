@@ -1,0 +1,12 @@
+﻿DATA_BLOCK "Sekvens_HMI"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 1.0
+   VAR
+      MinSekvens : "typ_SekvensHMI";   // HMI-interface for FB_MinSekvens (ikke retain)
+   END_VAR
+
+
+BEGIN
+
+END_DATA_BLOCK
+

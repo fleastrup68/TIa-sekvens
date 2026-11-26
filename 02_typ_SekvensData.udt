@@ -1,0 +1,10 @@
+﻿TYPE "typ_SekvensData"
+VERSION : 2.0
+   STRUCT
+      Step : Int;   // Aktivt step 0..16 (0 = hvile). Ligger i global RETAIN-DB
+      StepTid_s : LReal;   // Steptimer akkumuleret i sekunder
+      AntalCyklus : DInt;   // Antal gennemførte sekvenser
+      LogNr : DInt;   // Løbenummer til log
+   END_STRUCT;
+
+END_TYPE

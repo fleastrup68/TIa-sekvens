@@ -1,0 +1,13 @@
+﻿DATA_BLOCK "Sekvens_Data"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 2.0
+   VAR RETAIN
+      MinSekvens : "typ_SekvensData";   // Step-nr, steptimer, tællere for FB_MinSekvens
+      MinSekvens_Log : Array[0..49] of "typ_SekvensLog";   // Log for FB_MinSekvens, [0] = nyeste
+   END_VAR
+
+
+BEGIN
+
+END_DATA_BLOCK
+

@@ -1,0 +1,124 @@
+﻿FUNCTION "FC_SekvensTal" : String
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : Skabelon
+FAMILY : Sekvens
+VERSION : 1.0
+   VAR_INPUT
+      Tal : DInt;   // Tal der skal konverteres
+      Cifre : Int;   // Mindste antal cifre (foranstillede nuller)
+   END_VAR
+
+   VAR_TEMP
+      tempV : DInt;
+      tempD : DInt;
+      tempS : String[12];
+      tempN : Int;
+      tempNeg : Bool;
+   END_VAR
+
+
+BEGIN
+	//=============================================================================
+	// FC_SekvensTal - Heltal til tekst med foranstillede nuller, fx 7 -> '07'
+	//=============================================================================
+	#tempNeg := #Tal < 0;
+	IF #tempNeg THEN
+	    #tempV := -#Tal;
+	ELSE
+	    #tempV := #Tal;
+	END_IF;
+
+	#tempS := '';
+	#tempN := 0;
+	REPEAT
+	    #tempD := #tempV MOD 10;
+	    #tempS := CONCAT(IN1 := MID(IN := '0123456789', L := 1, P := DINT_TO_INT(#tempD) + 1),
+	                     IN2 := #tempS);
+	    #tempV := #tempV / 10;
+	    #tempN := #tempN + 1;
+	UNTIL (#tempV = 0 AND #tempN >= #Cifre) OR #tempN >= 10
+	END_REPEAT;
+
+	IF #tempNeg THEN
+	    #tempS := CONCAT(IN1 := '-', IN2 := #tempS);
+	END_IF;
+
+	#FC_SekvensTal := #tempS;
+END_FUNCTION
+
+FUNCTION "FC_SekvensLogTekst" : String
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : Skabelon
+FAMILY : Sekvens
+VERSION : 1.0
+   VAR_INPUT
+      Post : "typ_SekvensLog";   // Én linje fra loggen
+   END_VAR
+
+   VAR_TEMP
+      tempS : String[100];
+      tempSek : DInt;
+      tempAarsag : String[6];
+   END_VAR
+
+
+BEGIN
+	//=============================================================================
+	// FC_SekvensLogTekst - Én log-post som tekstlinje til HMI, fx:
+	//   #0012 26.11 14:03:21 S03>S04 00:05:12 Trans  Opvarm
+	//   Nr    Dato  Tid      Fra>Til TidIStep Årsag  Tekst for forladt step
+	//=============================================================================
+	IF #Post.Nr = 0 THEN
+	    #FC_SekvensLogTekst := '';   // Tom log-post
+	ELSE
+	    CASE #Post.Aarsag OF
+	        1: #tempAarsag := 'Trans ';
+	        2: #tempAarsag := 'Spring';
+	        3: #tempAarsag := 'Start ';
+	        4: #tempAarsag := 'Reset ';
+	        5: #tempAarsag := 'Slut  ';
+	        6: #tempAarsag := 'Tvang ';
+	        ELSE
+	            #tempAarsag := '?     ';
+	    END_CASE;
+
+	    // Løbenummer
+	    #tempS := CONCAT(IN1 := '#', IN2 := "FC_SekvensTal"(Tal := #Post.Nr MOD 10000, Cifre := 4));
+
+	    // Dato og klokkeslæt
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ' ');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := USINT_TO_DINT(#Post.Tidsstempel.DAY), Cifre := 2));
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := '.');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := USINT_TO_DINT(#Post.Tidsstempel.MONTH), Cifre := 2));
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ' ');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := USINT_TO_DINT(#Post.Tidsstempel.HOUR), Cifre := 2));
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ':');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := USINT_TO_DINT(#Post.Tidsstempel.MINUTE), Cifre := 2));
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ':');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := USINT_TO_DINT(#Post.Tidsstempel.SECOND), Cifre := 2));
+
+	    // Fra step > til step
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ' S');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := INT_TO_DINT(#Post.FraStep), Cifre := 2));
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := '>S');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := INT_TO_DINT(#Post.TilStep), Cifre := 2));
+
+	    // Tid i step som tt:mm:ss
+	    #tempSek := TIME_TO_DINT(#Post.TidIStep) / 1000;
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ' ');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := #tempSek / 3600, Cifre := 2));
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ':');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := (#tempSek MOD 3600) / 60, Cifre := 2));
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ':');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := "FC_SekvensTal"(Tal := #tempSek MOD 60, Cifre := 2));
+
+	    // Årsag og steptekst
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ' ');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := #tempAarsag);
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := ' ');
+	    #tempS := CONCAT(IN1 := #tempS, IN2 := #Post.FraTekst);
+
+	    #FC_SekvensLogTekst := #tempS;
+	END_IF;
+END_FUNCTION
+

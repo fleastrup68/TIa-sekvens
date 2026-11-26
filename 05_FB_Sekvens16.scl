@@ -1,0 +1,458 @@
+﻿FUNCTION_BLOCK "FB_Sekvens16"
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : Skabelon
+FAMILY : Sekvens
+VERSION : 2.1
+   VAR_INPUT
+      i_Prefix : String[20];   // Prefix i alarmtekst og på HMI, fx 'SPVA12'
+      i_Start : Bool;   // Start sekvens fra step 0 / fortsæt efter genstart-pause (positiv flanke)
+      i_Hold : Bool;   // Pause: ingen stepskift, steptimer står stille
+      i_Reset : Bool;   // Reset: sekvens til step 0 og kvittér alarm
+      i_StepMode : Bool;   // Step-for-step: transition + i_StepConfirm kræves for at skifte
+      i_StepConfirm : Bool;   // Bekræft stepskift i step-mode (positiv flanke)
+      i_AutoRestart : Bool;   // TRUE = efter sidste step -> step 1 igen, FALSE -> step 0
+      i_AlarmAck : Bool;   // Kvittér timeout-alarm
+      i_JumpTo : Int;   // Spring til step 1..16 (0 = intet spring). Prioritet over transition
+      i_ForceStep : Int;   // Tvang: step 0..16 der skal tvinges til (fra program)
+      i_Force : Bool;   // Tvang: udfør på positiv flanke - virker også i step 0 og under pause
+      i_Trans : Array[0..16] of Bool;   // Skiftebetingelser: [0] = startbetingelser, [n] = forlad step n
+      i_Naeste : Array[1..16] of Int;   // Næste step: 0 = n+1, 1..16 = spring, 99 = sekvens slut
+      i_MaxTid : Array[1..16] of Time;   // Max tid i step, T#0MS = ingen overvågning
+      i_Tekst : Array[0..16] of String[40];   // Beskrivelse af hvert step (HMI og log)
+   END_VAR
+
+   VAR_OUTPUT
+      o_Step : Int;   // Aktivt step (0 = hvile, 1..16)
+      o_StepBit : Array[0..16] of Bool;   // Step bits: o_StepBit[n] = TRUE når step n er aktivt
+      o_StepEntry : Bool;   // TRUE i én cyklus når et nyt step aktiveres
+      o_StepTime : Time;   // Steptimer: tid i aktivt step
+      o_StepTime_s : Real;   // Steptimer i sekunder
+      o_StepText : String[40];   // Tekst for aktivt step
+      o_Running : Bool;   // Sekvens kører (step <> 0)
+      o_Hold : Bool;   // Sekvens står i pause (i_Hold, HMI-pause eller genstart-pause)
+      o_RestartHold : Bool;   // Pause efter spændingsgenkomst/reinit - afventer Start eller Reset
+      o_WaitConfirm : Bool;   // Step-mode: transition opfyldt, venter på bekræft
+      o_Done : Bool;   // TRUE i én cyklus når sekvensen er gennemført
+      o_CycleCount : DInt;   // Antal gennemførte sekvenser
+      o_TimeoutAlarm : Bool;   // Step har overskredet i_MaxTid
+      o_TimeoutStep : Int;   // Step der gav timeout
+   END_VAR
+
+   VAR_IN_OUT
+      io_Data : "typ_SekvensData";   // Step-nr, steptimer, tællere - fra global RETAIN-DB
+      io_Log : Array[0..49] of "typ_SekvensLog";   // Log af de sidste 50 stepskift, [0] = nyeste
+      io_HMI : "typ_SekvensHMI";   // HMI-interface: kommandoer og status
+   END_VAR
+
+   VAR
+      statRuntimeMem : LReal;   // Hukommelse til RUNTIME (cyklustid)
+      statInitDone : Bool;   // FALSE efter opstart/reinit -> registrerer genstart
+      statRestartHold : Bool;   // Genstart-pause aktiv
+      statStartOld : Bool;   // Flankehukommelse start
+      statConfirmOld : Bool;   // Flankehukommelse bekræft
+      statForceOld : Bool;   // Flankehukommelse tvang
+      statAlarm : Bool;   // Timeout-alarm
+      statAlarmStep : Int;   // Step med timeout
+      statTimeoutLatch : Bool;   // Timeout allerede givet i dette step
+      statTomLog : "typ_SekvensLog";   // Tom log-post (skrives aldrig) - bruges til at slette loggen
+      statPA_Timeout : Program_Alarm;   // Alarm: timeout i step. Tekst: "@1%s@ Timeout i step @2%d@: @3%s@"
+      statPrefix : String[20];   // Ledsageværdi 1: prefix
+      statAlarmTekst : String[40];   // Ledsageværdi 3: tekst for step med timeout
+   END_VAR
+
+   VAR_TEMP
+      tempDelta_s : LReal;   // Tid siden sidste kald [s]
+      tempStart : Bool;   // Samlet: program OR HMI
+      tempReset : Bool;
+      tempConfirm : Bool;
+      tempStepMode : Bool;
+      tempAutoRestart : Bool;
+      tempAck : Bool;
+      tempForceHMI : Bool;
+      tempForceReq : Bool;
+      tempForceStep : Int;
+      tempStartEdge : Bool;
+      tempConfirmEdge : Bool;
+      tempForceEdge : Bool;
+      tempHold : Bool;
+      tempRebuild : Bool;   // Genopbyg HMI-logtekster
+      tempOldStep : Int;
+      tempNewStep : Int;
+      tempNext : Int;
+      tempCause : Int;
+      tempEnd : Bool;
+      tempI : Int;
+      tempRetVal : Int;
+      tempNow : DTL;
+   END_VAR
+
+   VAR CONSTANT
+      C_LAST_STEP : Int := 16;   // Sidste step
+      C_LOG_LAST : Int := 49;   // Sidste index i loggen
+      C_END : Int := 99;   // i_Naeste-værdi for "sekvens slut"
+      C_MAX_TIME_S : LReal := 2000000.0;   // Begrænsning af steptimer (~23 døgn, TIME max er ~24 døgn)
+      C_CAUSE_TRANS : Int := 1;   // Årsag: transition
+      C_CAUSE_JUMP : Int := 2;   // Årsag: spring (i_JumpTo)
+      C_CAUSE_START : Int := 3;   // Årsag: start fra step 0
+      C_CAUSE_RESET : Int := 4;   // Årsag: reset
+      C_CAUSE_END : Int := 5;   // Årsag: sekvens slut
+      C_CAUSE_FORCE : Int := 6;   // Årsag: tvang
+   END_VAR
+
+
+BEGIN
+	//=============================================================================
+	// FB_Sekvens16 - Genbrugelig sekvensmotor med 16 step   (RØR IKKE)
+	//-----------------------------------------------------------------------------
+	// Funktion:
+	//  - Step 0 = hvile. Step 1..16 = arbejdsstep.
+	//  - Step 0 -> 1 på positiv flanke af Start når i_Trans[0] (startbetingelser) er TRUE.
+	//  - Step n -> næste step når i_Trans[n] er TRUE.
+	//    Næste step = n+1, eller i_Naeste[n] (1..16 = spring, 99 = slut).
+	//  - Efter step 16 (eller i_Naeste = 99) er sekvensen slut -> step 0 (eller
+	//    step 1 ved auto-genstart).
+	//  - Steptimer nulstilles ved hvert stepskift og står stille i pause.
+	//  - Log af de sidste 50 stepskift i io_Log[0..49] ([0] = nyeste).
+	//  - Timeout-overvågning pr. step via i_MaxTid[n].
+	//  - Tvang: flanke på i_Force / HMI Cmd_Force sætter step = ForceStep (0..16)
+	//    uanset transition, pause og step-mode. Kun Reset har højere prioritet.
+	//    Fra HMI kun tilladt ved pause, step-mode, genstart-pause eller step 0.
+	//
+	// HMI (io_HMI):
+	//  - Kommandoer Cmd_xxx er pulser - HMI sætter bit, PLC nulstiller den.
+	//  - Sel_xxx er kontakter (holdes af HMI) og OR'es med programmets indgange.
+	//  - Status, stepoversigt og log som tekstlinjer opdateres af blokken.
+	//
+	// Retain:
+	//  - Step-nr, steptimer og log ligger i en global RETAIN-DB (io_Data/io_Log),
+	//    så de bevares når instans-DB'en reinitialiseres.
+	//  - Efter spændingsgenkomst eller reinit går sekvensen i genstart-pause i det
+	//    gemte step (o_RestartHold) indtil Start (fortsæt) eller Reset (step 0).
+	//
+	// Version  Dato        Ændring
+	// 1.0      2026-11-22  Første udgave
+	// 2.0      2026-11-26  Step/timer/log flyttet til InOut (global RETAIN-DB),
+	//                      konfiguration som indgange, steptekst i log, tvang
+	// 2.1      2026-11-26  HMI-interface (io_HMI)
+	// 2.2      2026-11-26  Program_Alarm for timeout med prefix (i_Prefix)
+	//=============================================================================
+
+	REGION Opstart og cyklustid
+	    // Sikring mod ugyldigt stepnummer (fx efter ændring i DB)
+	    IF #io_Data.Step < 0 OR #io_Data.Step > #C_LAST_STEP THEN
+	        #io_Data.Step := 0;
+	    END_IF;
+
+	    // Tid siden sidste kald af blokken (bruges til steptimeren)
+	    #tempDelta_s := RUNTIME(#statRuntimeMem);
+
+	    // Genopbyg HMI-logtekster ved opstart, eller hvis HMI-DB'en er blevet reinitialiseret
+	    #tempRebuild := NOT #statInitDone
+	                    OR (#io_Log[0].Nr <> 0 AND #io_HMI.LogTekst[0] = '');
+
+	    // Første kald efter opstart eller reinit af instans-DB'en
+	    IF NOT #statInitDone THEN
+	        #statInitDone := TRUE;
+	        #tempDelta_s := 0.0;   // Første RUNTIME-værdi er ikke gyldig
+	        IF #io_Data.Step <> 0 THEN
+	            #statRestartHold := TRUE;   // Sekvens stod i et step -> afvent operatør
+	        END_IF;
+	    END_IF;
+
+	    // Beskyttelse mod urealistiske værdier
+	    IF #tempDelta_s < 0.0 OR #tempDelta_s > 1.0 THEN
+	        #tempDelta_s := 0.0;
+	    END_IF;
+	END_REGION
+
+	REGION Kommandoer - program OR HMI
+	    // Tvang fra HMI kun i sikker tilstand
+	    #io_HMI.ForceTilladt := #i_Hold OR #io_HMI.Sel_Hold
+	                            OR #i_StepMode OR #io_HMI.Sel_StepMode
+	                            OR #statRestartHold
+	                            OR #io_Data.Step = 0;
+	    // og kun til et step der er i brug (har en tekst)
+	    IF #io_HMI.ForceStep >= 0 AND #io_HMI.ForceStep <= #C_LAST_STEP THEN
+	        #tempForceHMI := #io_HMI.Cmd_Force AND #io_HMI.ForceTilladt
+	                         AND LEN(#i_Tekst[#io_HMI.ForceStep]) > 0;
+	    ELSE
+	        #tempForceHMI := FALSE;
+	    END_IF;
+
+	    #tempStart := #i_Start OR #io_HMI.Cmd_Start;
+	    #tempReset := #i_Reset OR #io_HMI.Cmd_Reset;
+	    #tempConfirm := #i_StepConfirm OR #io_HMI.Cmd_StepConfirm;
+	    #tempAck := #i_AlarmAck OR #io_HMI.Cmd_AlarmAck;
+	    #tempStepMode := #i_StepMode OR #io_HMI.Sel_StepMode;
+	    #tempAutoRestart := #i_AutoRestart OR #io_HMI.Sel_AutoRestart;
+
+	    #tempForceReq := #i_Force OR #tempForceHMI;
+	    IF #tempForceHMI THEN
+	        #tempForceStep := #io_HMI.ForceStep;
+	    ELSE
+	        #tempForceStep := #i_ForceStep;
+	    END_IF;
+
+	    // Slet log
+	    IF #io_HMI.Cmd_SletLog THEN
+	        FOR #tempI := 0 TO #C_LOG_LAST DO
+	            #io_Log[#tempI] := #statTomLog;
+	        END_FOR;
+	        #tempRebuild := TRUE;
+	    END_IF;
+
+	    // HMI-pulser nulstilles - HMI kan derfor bruge "SetBit"
+	    #io_HMI.Cmd_Start := FALSE;
+	    #io_HMI.Cmd_Reset := FALSE;
+	    #io_HMI.Cmd_StepConfirm := FALSE;
+	    #io_HMI.Cmd_AlarmAck := FALSE;
+	    #io_HMI.Cmd_Force := FALSE;
+	    #io_HMI.Cmd_SletLog := FALSE;
+	END_REGION
+
+	REGION Flanker
+	    #tempStartEdge := #tempStart AND NOT #statStartOld;
+	    #statStartOld := #tempStart;
+
+	    #tempConfirmEdge := #tempConfirm AND NOT #statConfirmOld;
+	    #statConfirmOld := #tempConfirm;
+
+	    // Tvang kun med gyldigt stepnummer
+	    #tempForceEdge := #tempForceReq AND NOT #statForceOld
+	                      AND #tempForceStep >= 0 AND #tempForceStep <= #C_LAST_STEP;
+	    #statForceOld := #tempForceReq;
+	END_REGION
+
+	REGION Genstart-pause
+	    // Fortsæt i gemt step med Start, afbryd med Reset, eller tving til et step
+	    IF #statRestartHold AND (#tempStartEdge OR #tempReset OR #tempForceEdge) THEN
+	        #statRestartHold := FALSE;
+	        #tempStartEdge := FALSE;   // Startflanken må ikke også bruges til stepskift
+	    END_IF;
+
+	    #tempHold := #i_Hold OR #io_HMI.Sel_Hold OR #statRestartHold;
+	END_REGION
+
+	REGION Steptimer
+	    // Akkumuler tid i aktivt step - står stille under pause
+	    IF NOT #tempHold THEN
+	        #io_Data.StepTid_s := #io_Data.StepTid_s + #tempDelta_s;
+	    END_IF;
+
+	    IF #io_Data.StepTid_s > #C_MAX_TIME_S THEN
+	        #io_Data.StepTid_s := #C_MAX_TIME_S;
+	    ELSIF #io_Data.StepTid_s < 0.0 THEN
+	        #io_Data.StepTid_s := 0.0;
+	    END_IF;
+
+	    #o_StepTime := DINT_TO_TIME(LREAL_TO_DINT(#io_Data.StepTid_s * 1000.0));
+	END_REGION
+
+	REGION Beregn stepskift
+	    #tempOldStep := #io_Data.Step;
+	    #tempNewStep := #tempOldStep;
+	    #tempCause := 0;
+	    #tempEnd := FALSE;
+	    #o_Done := FALSE;
+	    #o_WaitConfirm := FALSE;
+
+	    IF #tempReset THEN
+	        // ---- Reset: altid til step 0 ----
+	        IF #tempOldStep <> 0 THEN
+	            #tempNewStep := 0;
+	            #tempCause := #C_CAUSE_RESET;
+	        END_IF;
+	        #io_Data.StepTid_s := 0.0;
+
+	    ELSIF #tempForceEdge THEN
+	        // ---- Tvang: direkte til valgt step - også fra step 0 og under pause ----
+	        IF #tempForceStep <> #tempOldStep THEN
+	            #tempNewStep := #tempForceStep;
+	            #tempCause := #C_CAUSE_FORCE;
+	        END_IF;
+
+	    ELSIF NOT #tempHold THEN
+	        IF #tempOldStep = 0 THEN
+	            // ---- Hvile: start sekvens ----
+	            IF #tempStartEdge AND #i_Trans[0] THEN
+	                #tempNewStep := 1;
+	                #tempCause := #C_CAUSE_START;
+	            END_IF;
+
+	        ELSIF #i_JumpTo >= 1 AND #i_JumpTo <= #C_LAST_STEP AND #i_JumpTo <> #tempOldStep THEN
+	            // ---- Spring til valgt step ----
+	            #tempNewStep := #i_JumpTo;
+	            #tempCause := #C_CAUSE_JUMP;
+
+	        ELSIF #i_Trans[#tempOldStep] THEN
+	            // ---- Transition opfyldt ----
+	            IF #tempStepMode AND NOT #tempConfirmEdge THEN
+	                #o_WaitConfirm := TRUE;   // Step-mode: vent på bekræftelse
+	            ELSE
+	                // Find næste step
+	                #tempNext := #i_Naeste[#tempOldStep];
+	                IF #tempNext < 1 OR #tempNext > #C_LAST_STEP OR #tempNext = #tempOldStep THEN
+	                    // 0, 99 eller ugyldig værdi
+	                    IF #tempNext = #C_END OR #tempOldStep >= #C_LAST_STEP THEN
+	                        #tempEnd := TRUE;
+	                    ELSE
+	                        #tempNext := #tempOldStep + 1;
+	                    END_IF;
+	                END_IF;
+
+	                IF #tempEnd THEN
+	                    // Sekvens gennemført
+	                    #o_Done := TRUE;
+	                    #io_Data.AntalCyklus := #io_Data.AntalCyklus + 1;
+	                    #tempCause := #C_CAUSE_END;
+	                    IF #tempAutoRestart AND #i_Trans[0] THEN
+	                        #tempNewStep := 1;
+	                    ELSE
+	                        #tempNewStep := 0;
+	                    END_IF;
+	                ELSE
+	                    #tempNewStep := #tempNext;
+	                    #tempCause := #C_CAUSE_TRANS;
+	                END_IF;
+	            END_IF;
+	        END_IF;
+	    END_IF;
+	END_REGION
+
+	REGION Udfør stepskift og log
+	    #o_StepEntry := FALSE;
+
+	    IF #tempCause <> 0 THEN
+	        // Skub loggen én plads ned - ældste ([49]) forsvinder
+	        FOR #tempI := #C_LOG_LAST TO 1 BY -1 DO
+	            #io_Log[#tempI] := #io_Log[#tempI - 1];
+	            #io_HMI.LogTekst[#tempI] := #io_HMI.LogTekst[#tempI - 1];
+	        END_FOR;
+
+	        // Skriv nyeste stepskift i [0]
+	        #io_Data.LogNr := #io_Data.LogNr + 1;
+	        #tempRetVal := RD_LOC_T(#tempNow);
+	        #io_Log[0].Nr := #io_Data.LogNr;
+	        #io_Log[0].FraStep := #tempOldStep;
+	        #io_Log[0].FraTekst := #i_Tekst[#tempOldStep];
+	        #io_Log[0].TilStep := #tempNewStep;
+	        #io_Log[0].Aarsag := #tempCause;
+	        #io_Log[0].TidIStep := #o_StepTime;
+	        #io_Log[0].Tidsstempel := #tempNow;
+
+	        // HMI: logtekst og seneste varighed for det forladte step
+	        #io_HMI.LogTekst[0] := "FC_SekvensLogTekst"(Post := #io_Log[0]);
+	        #io_HMI.SidsteTid_s[#tempOldStep] := LREAL_TO_REAL(#io_Data.StepTid_s);
+
+	        // Aktivér nyt step og nulstil steptimer
+	        #io_Data.Step := #tempNewStep;
+	        #io_Data.StepTid_s := 0.0;
+	        #statTimeoutLatch := FALSE;
+	        #o_StepEntry := TRUE;
+	    END_IF;
+	END_REGION
+
+	REGION Timeout-overvågning
+	    IF #tempAck OR #tempReset THEN
+	        #statAlarm := FALSE;
+	        #statAlarmStep := 0;
+	    END_IF;
+
+	    // Alarm gives én gang pr. step. Sekvensen stoppes IKKE automatisk -
+	    // brug o_TimeoutAlarm på i_Hold i kaldende blok hvis det ønskes.
+	    IF #io_Data.Step >= 1 AND #io_Data.Step <= #C_LAST_STEP THEN
+	        IF #i_MaxTid[#io_Data.Step] > T#0MS
+	            AND #io_Data.StepTid_s * 1000.0 > DINT_TO_LREAL(TIME_TO_DINT(#i_MaxTid[#io_Data.Step]))
+	            AND NOT #statTimeoutLatch
+	        THEN
+	            #statAlarm := TRUE;
+	            #statAlarmStep := #io_Data.Step;
+	            #statAlarmTekst := #i_Tekst[#io_Data.Step];
+	            #statTimeoutLatch := TRUE;
+	        END_IF;
+	    END_IF;
+	END_REGION
+
+	REGION Program_Alarm
+	    // Alarm til WinCC (Unified alarmliste/historik).
+	    // Alarmteksten sættes ÉN gang i FB_Sekvens16's alarm-editor, fx:
+	    //   @1%s@ Timeout i step @2%d@: @3%s@
+	    // -> "SPVA12 Timeout i step 3: Opvarm"
+	    // Kommer ved timeout, går ved kvittering (i_AlarmAck / HMI) eller reset.
+	    #statPrefix := #i_Prefix;
+	    #statPA_Timeout(SIG := #statAlarm,
+	                    SD_1 := #statPrefix,
+	                    SD_2 := #statAlarmStep,
+	                    SD_3 := #statAlarmTekst);
+	END_REGION
+
+	REGION Udgange
+	    // Step bits
+	    FOR #tempI := 0 TO #C_LAST_STEP DO
+	        #o_StepBit[#tempI] := (#tempI = #io_Data.Step);
+	    END_FOR;
+
+	    #o_Step := #io_Data.Step;
+	    #o_StepTime := DINT_TO_TIME(LREAL_TO_DINT(#io_Data.StepTid_s * 1000.0));
+	    #o_StepTime_s := LREAL_TO_REAL(#io_Data.StepTid_s);
+	    #o_StepText := #i_Tekst[#io_Data.Step];
+	    #o_Running := #io_Data.Step <> 0;
+	    #o_Hold := #tempHold AND #o_Running;
+	    #o_RestartHold := #statRestartHold;
+	    #o_CycleCount := #io_Data.AntalCyklus;
+	    #o_TimeoutAlarm := #statAlarm;
+	    #o_TimeoutStep := #statAlarmStep;
+	END_REGION
+
+	REGION HMI status
+	    #io_HMI.Prefix := #i_Prefix;
+	    #io_HMI.Step := #o_Step;
+	    #io_HMI.StepTekst := #o_StepText;
+	    #io_HMI.StepTid_s := #o_StepTime_s;
+	    #io_HMI.TransOK := #i_Trans[#io_Data.Step];
+	    #io_HMI.Running := #o_Running;
+	    #io_HMI.Hold := #o_Hold;
+	    #io_HMI.RestartHold := #o_RestartHold;
+	    #io_HMI.WaitConfirm := #o_WaitConfirm;
+	    #io_HMI.TimeoutAlarm := #o_TimeoutAlarm;
+	    #io_HMI.TimeoutStep := #o_TimeoutStep;
+	    #io_HMI.AntalCyklus := #o_CycleCount;
+
+	    // Stepoversigt
+	    #io_HMI.MaxTidListe_s[0] := 0.0;
+	    FOR #tempI := 0 TO #C_LAST_STEP DO
+	        #io_HMI.StepAktiv[#tempI] := #o_StepBit[#tempI];
+	        #io_HMI.Tekst[#tempI] := #i_Tekst[#tempI];
+	        #io_HMI.StepBrugt[#tempI] := LEN(#i_Tekst[#tempI]) > 0;
+	        IF #tempI >= 1 THEN
+	            #io_HMI.MaxTidListe_s[#tempI] := DINT_TO_REAL(TIME_TO_DINT(#i_MaxTid[#tempI])) / 1000.0;
+	        END_IF;
+	    END_FOR;
+
+	    // Max tid og resttid for aktivt step
+	    #io_HMI.MaxTid_s := #io_HMI.MaxTidListe_s[#io_Data.Step];
+	    IF #io_HMI.MaxTid_s > 0.0 AND #io_HMI.MaxTid_s > #io_HMI.StepTid_s THEN
+	        #io_HMI.RestTid_s := #io_HMI.MaxTid_s - #io_HMI.StepTid_s;
+	    ELSE
+	        #io_HMI.RestTid_s := 0.0;
+	    END_IF;
+
+	    // Genopbyg logtekster og seneste steptider ud fra den gemte log
+	    IF #tempRebuild THEN
+	        FOR #tempI := 0 TO #C_LAST_STEP DO
+	            #io_HMI.SidsteTid_s[#tempI] := 0.0;
+	        END_FOR;
+	        // Fra ældste til nyeste, så nyeste varighed vinder
+	        FOR #tempI := #C_LOG_LAST TO 0 BY -1 DO
+	            #io_HMI.LogTekst[#tempI] := "FC_SekvensLogTekst"(Post := #io_Log[#tempI]);
+	            IF #io_Log[#tempI].Nr <> 0
+	                AND #io_Log[#tempI].FraStep >= 0 AND #io_Log[#tempI].FraStep <= #C_LAST_STEP
+	            THEN
+	                #io_HMI.SidsteTid_s[#io_Log[#tempI].FraStep] := DINT_TO_REAL(TIME_TO_DINT(#io_Log[#tempI].TidIStep)) / 1000.0;
+	            END_IF;
+	        END_FOR;
+	    END_IF;
+	END_REGION
+
+END_FUNCTION_BLOCK
+
