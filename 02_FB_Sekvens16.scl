@@ -1,0 +1,291 @@
+﻿FUNCTION_BLOCK "FB_Sekvens16"
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : Skabelon
+FAMILY : Sekvens
+VERSION : 1.0
+   VAR_INPUT
+      i_Start : Bool;   // Start sekvens fra step 0 / fortsæt efter genstart-pause (positiv flanke)
+      i_Hold : Bool;   // Pause: ingen stepskift, steptimer står stille
+      i_Reset : Bool;   // Reset: sekvens til step 0 og kvittér alarm
+      i_StepMode : Bool;   // Step-for-step: transition + i_StepConfirm kræves for at skifte
+      i_StepConfirm : Bool;   // Bekræft stepskift i step-mode (positiv flanke)
+      i_AutoRestart : Bool;   // TRUE = efter sidste step -> step 1 igen, FALSE -> step 0
+      i_AlarmAck : Bool;   // Kvittér timeout-alarm
+      i_JumpTo : Int;   // Spring til step 1..16 (0 = intet spring). Prioritet over transition
+      i_Trans : Array[0..16] of Bool;   // Skiftebetingelser: [0] = startbetingelser, [n] = forlad step n
+   END_VAR
+
+   VAR_OUTPUT
+      o_Step : Int;   // Aktivt step (0 = hvile, 1..16)
+      o_StepBit : Array[0..16] of Bool;   // Step bits: o_StepBit[n] = TRUE når step n er aktivt
+      o_StepEntry : Bool;   // TRUE i én cyklus når et nyt step aktiveres
+      o_StepTime : Time;   // Steptimer: tid i aktivt step
+      o_StepTime_s : Real;   // Steptimer i sekunder (til HMI)
+      o_StepText : String[40];   // Tekst for aktivt step (til HMI)
+      o_Running : Bool;   // Sekvens kører (step <> 0)
+      o_Hold : Bool;   // Sekvens står i pause (i_Hold eller genstart-pause)
+      o_RestartHold : Bool;   // Pause efter spændingsgenkomst - afventer Start eller Reset
+      o_WaitConfirm : Bool;   // Step-mode: transition opfyldt, venter på i_StepConfirm
+      o_Done : Bool;   // TRUE i én cyklus når sekvensen er gennemført
+      o_CycleCount : DInt;   // Antal gennemførte sekvenser
+      o_TimeoutAlarm : Bool;   // Step har overskredet Config.MaxTime
+      o_TimeoutStep : Int;   // Step der gav timeout
+   END_VAR
+
+   VAR RETAIN
+      statStep : Int;   // Aktivt step - RETAIN, bevares ved spændingsfald
+      statStepTime_s : LReal;   // Steptimer akkumuleret i sekunder - RETAIN
+      statCycleCount : DInt;   // Antal gennemførte sekvenser - RETAIN
+      statLogNr : DInt;   // Løbenummer til log - RETAIN
+   END_VAR
+   VAR
+      Config : Struct   // Konfiguration - sættes fra kaldende blok eller som startværdi i DB
+         NextStep : Array[1..16] of Int;   // 0 = næste step (n+1), 1..16 = spring til step, 99 = sekvens slut
+         MaxTime : Array[1..16] of Time;   // Max tid i step, T#0MS = ingen overvågning
+         StepText : Array[0..16] of String[40];   // Beskrivelse af hvert step
+      END_STRUCT;
+      Log : Array[0..49] of "typ_SekvensLog";   // Log af de sidste 50 stepskift, [0] = nyeste
+      statRuntimeMem : LReal;   // Hukommelse til RUNTIME (cyklustid)
+      statInitDone : Bool;   // FALSE efter opstart (non-retain) -> registrerer spændingsgenkomst
+      statRestartHold : Bool;   // Genstart-pause aktiv
+      statStartOld : Bool;   // Flankehukommelse i_Start
+      statConfirmOld : Bool;   // Flankehukommelse i_StepConfirm
+      statAlarm : Bool;   // Timeout-alarm
+      statAlarmStep : Int;   // Step med timeout
+      statTimeoutLatch : Bool;   // Timeout allerede givet i dette step
+   END_VAR
+
+   VAR_TEMP
+      tempDelta_s : LReal;   // Tid siden sidste kald [s]
+      tempStartEdge : Bool;
+      tempConfirmEdge : Bool;
+      tempHold : Bool;
+      tempNewStep : Int;
+      tempNext : Int;
+      tempCause : Int;
+      tempEnd : Bool;
+      tempI : Int;
+      tempRetVal : Int;
+      tempNow : DTL;
+   END_VAR
+
+   VAR CONSTANT
+      C_LAST_STEP : Int := 16;   // Sidste step
+      C_END : Int := 99;   // NextStep-værdi for "sekvens slut"
+      C_MAX_TIME_S : LReal := 2000000.0;   // Begrænsning af steptimer (~23 døgn, TIME max er ~24 døgn)
+      C_CAUSE_TRANS : Int := 1;   // Årsag: transition
+      C_CAUSE_JUMP : Int := 2;   // Årsag: spring (i_JumpTo)
+      C_CAUSE_START : Int := 3;   // Årsag: start fra step 0
+      C_CAUSE_RESET : Int := 4;   // Årsag: reset
+      C_CAUSE_END : Int := 5;   // Årsag: sekvens slut
+   END_VAR
+
+
+BEGIN
+	//=============================================================================
+	// FB_Sekvens16 - Genbrugelig sekvensmotor med 16 step
+	//-----------------------------------------------------------------------------
+	// Funktion:
+	//  - Step 0 = hvile. Step 1..16 = arbejdsstep.
+	//  - Step 0 -> 1 på positiv flanke af i_Start når i_Trans[0] (startbetingelser) er TRUE.
+	//  - Step n -> næste step når i_Trans[n] er TRUE.
+	//    Næste step = n+1, eller Config.NextStep[n] (1..16 = spring, 99 = slut).
+	//  - Efter step 16 (eller NextStep = 99) er sekvensen slut -> step 0 (eller step 1
+	//    ved i_AutoRestart).
+	//  - Steptimer (o_StepTime) nulstilles ved hvert stepskift og står stille i pause.
+	//  - Log af de sidste 50 stepskift i #Log[0..49] ([0] = nyeste).
+	//  - Timeout-overvågning pr. step via Config.MaxTime[n].
+	//  - Step-nummer, steptimer og tællere er RETAIN. Efter spændingsgenkomst går
+	//    sekvensen i genstart-pause i det gemte step (o_RestartHold) indtil
+	//    i_Start (fortsæt) eller i_Reset (til step 0).
+	//
+	// Brug: Se FB_MinSekvens (skabelon) for kald, transitioner og step bits.
+	//
+	// Version  Dato        Ændring
+	// 1.0      2026-11-22  Første udgave
+	//=============================================================================
+
+	REGION Opstart og cyklustid
+	    // Sikring mod ugyldigt stepnummer (fx efter ændring i DB)
+	    IF #statStep < 0 OR #statStep > #C_LAST_STEP THEN
+	        #statStep := 0;
+	    END_IF;
+
+	    // Tid siden sidste kald af blokken (bruges til steptimeren)
+	    #tempDelta_s := RUNTIME(#statRuntimeMem);
+
+	    // Første kald efter opstart: statInitDone er non-retain og derfor FALSE
+	    IF NOT #statInitDone THEN
+	        #statInitDone := TRUE;
+	        #tempDelta_s := 0.0;   // Første RUNTIME-værdi er ikke gyldig
+	        IF #statStep <> 0 THEN
+	            #statRestartHold := TRUE;   // Sekvens stod i et step -> afvent operatør
+	        END_IF;
+	    END_IF;
+
+	    // Beskyttelse mod urealistiske værdier
+	    IF #tempDelta_s < 0.0 OR #tempDelta_s > 1.0 THEN
+	        #tempDelta_s := 0.0;
+	    END_IF;
+	END_REGION
+
+	REGION Flanker
+	    #tempStartEdge := #i_Start AND NOT #statStartOld;
+	    #statStartOld := #i_Start;
+
+	    #tempConfirmEdge := #i_StepConfirm AND NOT #statConfirmOld;
+	    #statConfirmOld := #i_StepConfirm;
+	END_REGION
+
+	REGION Genstart-pause
+	    // Fortsæt i gemt step med Start, eller afbryd med Reset
+	    IF #statRestartHold AND (#tempStartEdge OR #i_Reset) THEN
+	        #statRestartHold := FALSE;
+	        #tempStartEdge := FALSE;   // Startflanken må ikke også bruges til stepskift
+	    END_IF;
+
+	    #tempHold := #i_Hold OR #statRestartHold;
+	END_REGION
+
+	REGION Steptimer
+	    // Akkumuler tid i aktivt step - står stille under pause
+	    IF NOT #tempHold THEN
+	        #statStepTime_s := #statStepTime_s + #tempDelta_s;
+	    END_IF;
+
+	    IF #statStepTime_s > #C_MAX_TIME_S THEN
+	        #statStepTime_s := #C_MAX_TIME_S;
+	    END_IF;
+
+	    #o_StepTime := DINT_TO_TIME(LREAL_TO_DINT(#statStepTime_s * 1000.0));
+	END_REGION
+
+	REGION Beregn stepskift
+	    #tempNewStep := #statStep;
+	    #tempCause := 0;
+	    #tempEnd := FALSE;
+	    #o_Done := FALSE;
+	    #o_WaitConfirm := FALSE;
+
+	    IF #i_Reset THEN
+	        // ---- Reset: altid til step 0 ----
+	        IF #statStep <> 0 THEN
+	            #tempNewStep := 0;
+	            #tempCause := #C_CAUSE_RESET;
+	        END_IF;
+
+	    ELSIF NOT #tempHold THEN
+	        IF #statStep = 0 THEN
+	            // ---- Hvile: start sekvens ----
+	            IF #tempStartEdge AND #i_Trans[0] THEN
+	                #tempNewStep := 1;
+	                #tempCause := #C_CAUSE_START;
+	            END_IF;
+
+	        ELSIF #i_JumpTo >= 1 AND #i_JumpTo <= #C_LAST_STEP AND #i_JumpTo <> #statStep THEN
+	            // ---- Spring til valgt step ----
+	            #tempNewStep := #i_JumpTo;
+	            #tempCause := #C_CAUSE_JUMP;
+
+	        ELSIF #i_Trans[#statStep] THEN
+	            // ---- Transition opfyldt ----
+	            IF #i_StepMode AND NOT #tempConfirmEdge THEN
+	                #o_WaitConfirm := TRUE;   // Step-mode: vent på bekræftelse
+	            ELSE
+	                // Find næste step
+	                #tempNext := #Config.NextStep[#statStep];
+	                IF #tempNext < 1 OR #tempNext > #C_LAST_STEP OR #tempNext = #statStep THEN
+	                    // 0, 99 eller ugyldig værdi
+	                    IF #tempNext = #C_END OR #statStep >= #C_LAST_STEP THEN
+	                        #tempEnd := TRUE;
+	                    ELSE
+	                        #tempNext := #statStep + 1;
+	                    END_IF;
+	                END_IF;
+
+	                IF #tempEnd THEN
+	                    // Sekvens gennemført
+	                    #o_Done := TRUE;
+	                    #statCycleCount := #statCycleCount + 1;
+	                    #tempCause := #C_CAUSE_END;
+	                    IF #i_AutoRestart AND #i_Trans[0] THEN
+	                        #tempNewStep := 1;
+	                    ELSE
+	                        #tempNewStep := 0;
+	                    END_IF;
+	                ELSE
+	                    #tempNewStep := #tempNext;
+	                    #tempCause := #C_CAUSE_TRANS;
+	                END_IF;
+	            END_IF;
+	        END_IF;
+	    END_IF;
+	END_REGION
+
+	REGION Udfør stepskift og log
+	    #o_StepEntry := FALSE;
+
+	    IF #tempCause <> 0 THEN
+	        // Skub loggen én plads ned - ældste ([49]) forsvinder
+	        FOR #tempI := 49 TO 1 BY -1 DO
+	            #Log[#tempI] := #Log[#tempI - 1];
+	        END_FOR;
+
+	        // Skriv nyeste stepskift i [0]
+	        #statLogNr := #statLogNr + 1;
+	        #tempRetVal := RD_LOC_T(#tempNow);
+	        #Log[0].Nr := #statLogNr;
+	        #Log[0].FraStep := #statStep;
+	        #Log[0].TilStep := #tempNewStep;
+	        #Log[0].Aarsag := #tempCause;
+	        #Log[0].TidIStep := #o_StepTime;
+	        #Log[0].Tidsstempel := #tempNow;
+
+	        // Aktivér nyt step og nulstil steptimer
+	        #statStep := #tempNewStep;
+	        #statStepTime_s := 0.0;
+	        #statTimeoutLatch := FALSE;
+	        #o_StepEntry := TRUE;
+	    END_IF;
+	END_REGION
+
+	REGION Timeout-overvågning
+	    IF #i_AlarmAck OR #i_Reset THEN
+	        #statAlarm := FALSE;
+	        #statAlarmStep := 0;
+	    END_IF;
+
+	    // Alarm gives én gang pr. step. Sekvensen stoppes IKKE automatisk -
+	    // brug o_TimeoutAlarm på i_Hold i kaldende blok hvis det ønskes.
+	    IF #statStep >= 1 AND #statStep <= #C_LAST_STEP THEN
+	        IF #Config.MaxTime[#statStep] > T#0MS
+	            AND #statStepTime_s * 1000.0 > DINT_TO_LREAL(TIME_TO_DINT(#Config.MaxTime[#statStep]))
+	            AND NOT #statTimeoutLatch
+	        THEN
+	            #statAlarm := TRUE;
+	            #statAlarmStep := #statStep;
+	            #statTimeoutLatch := TRUE;
+	        END_IF;
+	    END_IF;
+	END_REGION
+
+	REGION Udgange
+	    // Step bits
+	    FOR #tempI := 0 TO #C_LAST_STEP DO
+	        #o_StepBit[#tempI] := (#tempI = #statStep);
+	    END_FOR;
+
+	    #o_Step := #statStep;
+	    #o_StepTime := DINT_TO_TIME(LREAL_TO_DINT(#statStepTime_s * 1000.0));
+	    #o_StepTime_s := LREAL_TO_REAL(#statStepTime_s);
+	    #o_StepText := #Config.StepText[#statStep];
+	    #o_Running := #statStep <> 0;
+	    #o_Hold := #tempHold AND #o_Running;
+	    #o_RestartHold := #statRestartHold;
+	    #o_CycleCount := #statCycleCount;
+	    #o_TimeoutAlarm := #statAlarm;
+	    #o_TimeoutStep := #statAlarmStep;
+	END_REGION
+
+END_FUNCTION_BLOCK
+

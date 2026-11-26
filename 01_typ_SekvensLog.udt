@@ -1,0 +1,12 @@
+﻿TYPE "typ_SekvensLog"
+VERSION : 1.0
+   STRUCT
+      Nr : DInt;   // Løbenummer for stepskiftet (stiger altid)
+      FraStep : Int;   // Step der blev forladt
+      TilStep : Int;   // Step der blev aktiveret
+      Aarsag : Int;   // 1=Transition 2=Spring 3=Start 4=Reset 5=Sekvens slut
+      TidIStep : Time;   // Hvor længe FraStep var aktiv
+      Tidsstempel : DTL;   // Lokal tid for stepskiftet
+   END_STRUCT;
+
+END_TYPE

@@ -1,0 +1,209 @@
+﻿FUNCTION_BLOCK "FB_MinSekvens"
+{ S7_Optimized_Access := 'TRUE' }
+AUTHOR : Skabelon
+FAMILY : Sekvens
+VERSION : 1.0
+   VAR_INPUT
+      i_Start : Bool;   // Start / fortsæt efter genstart-pause
+      i_Hold : Bool;   // Pause
+      i_Reset : Bool;   // Reset til step 0
+      i_StepMode : Bool;   // Step-for-step (idriftsætning)
+      i_StepConfirm : Bool;   // Bekræft stepskift i step-mode
+      i_AlarmAck : Bool;   // Kvittér alarm
+      i_AutoRestart : Bool;   // Kør sekvensen igen og igen
+      // ---- Procesignaler - EKSEMPEL, ret til jeres anlæg ----
+      i_Fejl : Bool;   // Samlet fejl -> pause
+      i_NiveauHoej : Bool;   // Niveauvagt høj i tank
+      i_NiveauLav : Bool;   // Niveauvagt lav i tank (TRUE = tank tom)
+      i_TempOK : Bool;   // Temperatur nået
+      i_M1_Koerer : Bool;   // Tilbagemelding omrører M1
+   END_VAR
+
+   VAR_OUTPUT
+      // ---- Aktuatorer - EKSEMPEL, ret til jeres anlæg ----
+      o_V1_Indloeb : Bool;   // Ventil V1 indløb
+      o_V2_Udloeb : Bool;   // Ventil V2 udløb
+      o_M1_Omroerer : Bool;   // Motor M1 omrører
+      o_Varme : Bool;   // Varmelegeme
+      // ---- Status ----
+      o_Step : Int;   // Aktivt step
+      o_Running : Bool;   // Sekvens kører
+      o_Alarm : Bool;   // Timeout-alarm
+   END_VAR
+
+   VAR
+      Seq : "FB_Sekvens16";   // Sekvensmotor (multi-instans)
+      Trans : Array[0..16] of Bool;   // Skiftebetingelser
+      JumpTo : Int;   // Spring til step (0 = intet)
+   END_VAR
+
+   VAR_TEMP
+      tempUdgangOK : Bool;   // Aktuatorer må aktiveres
+   END_VAR
+
+
+BEGIN
+	//=============================================================================
+	// FB_MinSekvens - SKABELON til en sekvens med 16 step
+	//-----------------------------------------------------------------------------
+	// Kopiér denne blok for hver ny sekvens (fx FB_Tank1_Sekvens).
+	// Hvert step har sin egen REGION med:
+	//   StepText  - beskrivelse (vises på HMI og i log)
+	//   MaxTime   - max tid i step før alarm (T#0MS = ingen overvågning)
+	//   NextStep  - kun hvis der skal springes/sluttes (0 = n+1, 99 = slut)
+	//   Trans[n]  - skiftebetingelse for at FORLADE step n
+	//
+	// Steptimer: #Seq.o_StepTime er tiden i det aktive step, fx
+	//   #Trans[2] := #Seq.o_StepTime >= T#10S;
+	//
+	// Step bits: #Seq.o_StepBit[n] er TRUE når step n er aktivt. Brug dem i
+	// REGION "Udgange" til ventiler og motorblokke.
+	//
+	// Eksemplet: fyld tank -> start omrører -> opvarm -> omrør 10 min -> tøm.
+	//=============================================================================
+
+	REGION Step 00 - Hvile / startbetingelser
+	    #Seq.Config.StepText[0] := 'Hvile - klar til start';
+	    // Startbetingelser: sekvens kan startes når disse er TRUE
+	    #Trans[0] := NOT #i_Fejl AND #i_NiveauLav;
+	END_REGION
+
+	REGION Step 01 - Fyld tank
+	    #Seq.Config.StepText[1] := 'Fyld tank';
+	    #Seq.Config.MaxTime[1] := T#2M;
+	    #Trans[1] := #i_NiveauHoej;
+	END_REGION
+
+	REGION Step 02 - Start omrører
+	    #Seq.Config.StepText[2] := 'Start omrører';
+	    #Seq.Config.MaxTime[2] := T#10S;
+	    // Motor skal melde kørende i mindst 2 s
+	    #Trans[2] := #i_M1_Koerer AND #Seq.o_StepTime >= T#2S;
+	END_REGION
+
+	REGION Step 03 - Opvarm
+	    #Seq.Config.StepText[3] := 'Opvarm';
+	    #Seq.Config.MaxTime[3] := T#30M;
+	    #Trans[3] := #i_TempOK;
+	END_REGION
+
+	REGION Step 04 - Omrør 10 min
+	    #Seq.Config.StepText[4] := 'Omrør 10 min';
+	    // Ren tidsstyring med steptimeren
+	    #Trans[4] := #Seq.o_StepTime >= T#10M;
+	END_REGION
+
+	REGION Step 05 - Tøm tank
+	    #Seq.Config.StepText[5] := 'Tøm tank';
+	    #Seq.Config.MaxTime[5] := T#3M;
+	    #Seq.Config.NextStep[5] := 99;   // Sidste step i dette eksempel -> sekvens slut
+	    // Tank tom + 5 s efterløb
+	    #Trans[5] := #i_NiveauLav AND #Seq.o_StepTime >= T#5S;
+	END_REGION
+
+	REGION Step 06
+	    #Seq.Config.StepText[6] := 'Step 06';
+	    #Trans[6] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 07
+	    #Seq.Config.StepText[7] := 'Step 07';
+	    #Trans[7] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 08
+	    #Seq.Config.StepText[8] := 'Step 08';
+	    #Trans[8] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 09
+	    #Seq.Config.StepText[9] := 'Step 09';
+	    #Trans[9] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 10
+	    #Seq.Config.StepText[10] := 'Step 10';
+	    #Trans[10] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 11
+	    #Seq.Config.StepText[11] := 'Step 11';
+	    #Trans[11] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 12
+	    #Seq.Config.StepText[12] := 'Step 12';
+	    #Trans[12] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 13
+	    #Seq.Config.StepText[13] := 'Step 13';
+	    #Trans[13] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 14
+	    #Seq.Config.StepText[14] := 'Step 14';
+	    #Trans[14] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 15
+	    #Seq.Config.StepText[15] := 'Step 15';
+	    #Trans[15] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Step 16
+	    #Seq.Config.StepText[16] := 'Step 16';
+	    #Trans[16] := FALSE;   // TODO: skiftebetingelse
+	END_REGION
+
+	REGION Spring (valgfrit)
+	    // Spring direkte til et andet step uafhængigt af transitionen.
+	    // Eksempel: fejl i opvarmning -> tøm tanken
+	    // IF #Seq.o_StepBit[3] AND #i_Fejl THEN
+	    //     #JumpTo := 5;
+	    // ELSE
+	    //     #JumpTo := 0;
+	    // END_IF;
+	    #JumpTo := 0;
+	END_REGION
+
+	REGION Kald sekvensmotor
+	    #Seq(i_Start := #i_Start,
+	         i_Hold := #i_Hold OR #i_Fejl,
+	         i_Reset := #i_Reset,
+	         i_StepMode := #i_StepMode,
+	         i_StepConfirm := #i_StepConfirm,
+	         i_AutoRestart := #i_AutoRestart,
+	         i_AlarmAck := #i_AlarmAck,
+	         i_JumpTo := #JumpTo,
+	         i_Trans := #Trans);
+	END_REGION
+
+	REGION Udgange - step bits til ventiler og motorer
+	    // Ingen aktuatorer efter spændingsgenkomst før operatøren har givet Start
+	    #tempUdgangOK := NOT #Seq.o_RestartHold;
+
+	    // Én linje pr. aktuator - OR de step hvor den skal være aktiv
+	    #o_V1_Indloeb := #tempUdgangOK AND #Seq.o_StepBit[1];
+
+	    #o_M1_Omroerer := #tempUdgangOK AND (#Seq.o_StepBit[2]
+	                                     OR #Seq.o_StepBit[3]
+	                                     OR #Seq.o_StepBit[4]);
+
+	    // Varme slukkes også ved pause
+	    #o_Varme := #tempUdgangOK AND #Seq.o_StepBit[3] AND NOT #Seq.o_Hold;
+
+	    #o_V2_Udloeb := #tempUdgangOK AND #Seq.o_StepBit[5];
+
+	    // Motorblokke kan også skrives direkte, fx:
+	    // "M1_Motor_DB".AutoStart := #o_M1_Omroerer;
+	END_REGION
+
+	REGION Status
+	    #o_Step := #Seq.o_Step;
+	    #o_Running := #Seq.o_Running;
+	    #o_Alarm := #Seq.o_TimeoutAlarm;
+	END_REGION
+
+END_FUNCTION_BLOCK
+
